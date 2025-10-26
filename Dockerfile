@@ -5,12 +5,15 @@ FROM node:20-alpine AS build
 WORKDIR /app
 
 # Install dependencies
-COPY package*.json ./
+COPY package*.json tsconfig*.json ./
 RUN npm ci
-RUN npm install -D vite
+RUN npm install -D vite @vitejs/plugin-react-swc
 
-# Copy source and build
+# Copy source and config files
 COPY . .
+
+# Build the application
+ENV NODE_ENV=production
 RUN npm run build
 
 # Production image - use a small static server
