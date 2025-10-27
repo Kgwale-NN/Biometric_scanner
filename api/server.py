@@ -1,5 +1,6 @@
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.staticfiles import StaticFiles
 import cv2
 import numpy as np
 import base64
@@ -12,14 +13,18 @@ import hashlib
 # Initialize FastAPI app
 app = FastAPI(title="Biometric Car Security API")
 
-# Add CORS middleware
+# Add CORS middleware (allow all origins for deployments; restrict locally if needed)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://127.0.0.1:5173", "http://192.168.10.118:5173"], # Allow both localhost and network access
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Serve the built frontend (Vite build) from the `api/static` folder.
+# The Dockerfile copies the frontend `dist` into `api/static` at build time.
+app.mount("/", StaticFiles(directory="api/static", html=True), name="static")
 
 # Constants
 FACE_FOLDER = "biometric_faces"

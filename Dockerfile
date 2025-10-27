@@ -1,33 +1,40 @@
-# Multi-stage Dockerfile for building and serving a Vite React app
+# Multi-stage Dockerfile for a monorepo: build the Vite frontend then build/run the Python FastAPI backend
 
-# Build stage
-FROM node:20-alpine AS build
-WORKDIR /app
+# ---------- Stage 1: Build frontend ----------
+FROM node:20-alpine AS node-build
+WORKDIR /workspace/frontend
 
-# Install dependencies
-COPY package*.json tsconfig*.json ./
+# Install dependencies (copy only package files first for better caching)
+COPY package*.json tsconfig*.json vite.config.ts ./
 RUN npm ci
-RUN npm install -D vite @vitejs/plugin-react-swc
 
-# Copy source and config files
+# Copy source and build
 COPY . .
-
-# Build the application
 ENV NODE_ENV=production
 RUN npm run build
 
-# Production image - use a small static server
-FROM node:20-alpine AS prod
+
+# ---------- Stage 2: Build runtime image (Python) ----------
+FROM python:3.11-slim AS runtime
 WORKDIR /app
 
-# Install a tiny static file server globally
-RUN npm install -g serve@14.1.2
+# System dependencies needed for opencv/dlib/face-recognition and general builds
+RUN apt-get update \
+	&& apt-get install -y --no-install-recommends build-essential cmake libglib2.0-0 libsm6 libxext6 libxrender1 libgl1 git curl \
+	&& rm -rf /var/lib/apt/lists/*
 
-# Copy built assets from build stage
-COPY --from=build /app/dist ./dist
+# Copy and install Python dependencies
+COPY requirements.txt ./
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Copy backend source
+COPY api ./api
+
+# Copy built frontend assets into backend static folder
+COPY --from=node-build /workspace/frontend/dist ./api/static
 
 ENV PORT=3000
 EXPOSE 3000
 
-# Use the PORT environment variable provided by Railway at runtime
-CMD ["sh", "-c", "serve -s dist -l $PORT"]
+# Use gunicorn with uvicorn worker for production-grade serving
+CMD ["gunicorn", "api.server:app", "--workers", "4", "--worker-class", "uvicorn.workers.UvicornWorker", "--bind", "0.0.0.0:$PORT"]
