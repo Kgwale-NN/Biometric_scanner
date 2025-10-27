@@ -119,20 +119,19 @@ if face_cascade is None:
     print("Suggestion: ensure 'haarcascade_frontalface_default.xml' is present in the 'api/' folder or in OpenCV data directories.")
     print("You can copy the file into api/ from OpenCV (if installed) or download it from: https://github.com/opencv/opencv/tree/master/data/haarcascades")
 
-# Try to import face_recognition, fall back to basic detection if not available
+# Try to import face_recognition. If unavailable, set a flag and continue so the
+# FastAPI app can start. Endpoints that require face_recognition will return a
+# clear 501 response asking the user to install the optional dependency.
 try:
     import face_recognition
     FACE_RECOGNITION_AVAILABLE = True
-    print(" face_recognition library loaded")
+    print("face_recognition library loaded")
 except ImportError:
     FACE_RECOGNITION_AVAILABLE = False
-    print(" face_recognition not available, using basic OpenCV detection")
-    print("To enable face_recognition (recommended for better accuracy) consider installing it in a conda environment:")
-    print("  conda create -n biometric python=3.11 -y")
-    print("  conda activate biometric")
-    print("  conda install -c conda-forge dlib face_recognition cmake -y")
-    print("Or try (may require build tools) using pip in WSL or a suitable environment:")
-    print("  pip install cmake dlib face_recognition")
+    print("face_recognition not available. Endpoints that require face recognition will return an informative error.")
+    print("To enable face_recognition (note: this often requires compiling dlib or using conda):")
+    print("  (recommended) install with conda: conda install -c conda-forge dlib face_recognition cmake")
+    print("  or in an environment with build tools try: pip install cmake dlib face_recognition")
 
 def initialize_database():
     """Initialize all database files on startup"""
@@ -300,6 +299,10 @@ async def register_user(
     vehicle_reg: str,
     face_image: UploadFile = File(...)
 ):
+    # Ensure face_recognition is available before attempting registration
+    if not FACE_RECOGNITION_AVAILABLE:
+        raise HTTPException(status_code=501, detail="face_recognition package is not installed. Install it to use face registration endpoints.")
+
     try:
         # Read and process the uploaded image
         contents = await face_image.read()
@@ -412,6 +415,9 @@ async def register_user(
 @app.post("/api/verify-face")
 async def verify_face(face_image: UploadFile = File(...)):
     try:
+        if not FACE_RECOGNITION_AVAILABLE:
+            return {"status": "error", "message": "face_recognition package not installed. Install it to use face verification.", "match_score": 0}
+
         # Read and process the uploaded image
         contents = await face_image.read()
         nparr = np.frombuffer(contents, np.uint8)
