@@ -10,6 +10,8 @@ from datetime import datetime
 import os
 from typing import Optional
 import hashlib
+import traceback
+import logging
 
 # Initialize FastAPI app
 app = FastAPI(title="Biometric Car Security API")
@@ -43,13 +45,55 @@ app.add_middleware(
 )
 
 # --- PERSISTENT DATA PATHS ---
-FACE_FOLDER = "/app/data/biometric_faces"
-USERS_DB = "/app/data/users_database.encrypted"
-CONFIG_FILE = "/app/data/system_config.encrypted"
-ACCESS_LOG = "/app/data/access_log.json"
-GPS_LOG = "/app/data/gps_log.json"
-FACE_ENCODINGS_FILE = "/app/data/face_encodings.encrypted"
+# Data paths -- prefer a Docker-friendly absolute path when available, but
+# fall back to a repo-local path for local development (so files you drop
+# into api/biometric_faces are visible to the running server).
+DEFAULT_DATA_DIR = "/app/data"
+MODULE_PATH = Path(__file__).resolve().parent
+MODULE_DATA_DIR = MODULE_PATH / "data"
+MODULE_BIOMETRIC_DIR = MODULE_PATH / "biometric_faces"
+
+# Priority: explicit FACE_FOLDER env -> /app/data (Docker) -> repo/api/biometric_faces -> repo/api/data -> repo/api/data (create)
+env_face_folder = os.getenv("FACE_FOLDER")
+if env_face_folder:
+    base_data_dir = env_face_folder
+elif os.path.exists(DEFAULT_DATA_DIR):
+    base_data_dir = DEFAULT_DATA_DIR
+elif MODULE_BIOMETRIC_DIR.exists():
+    base_data_dir = str(MODULE_PATH)
+elif MODULE_DATA_DIR.exists():
+    base_data_dir = str(MODULE_DATA_DIR)
+else:
+    # Default local data dir (will be created if needed)
+    base_data_dir = str(MODULE_DATA_DIR)
+
+FACE_FOLDER = os.path.join(base_data_dir, "biometric_faces")
+USERS_DB = os.path.join(base_data_dir, "users_database.encrypted")
+CONFIG_FILE = os.path.join(base_data_dir, "system_config.encrypted")
+ACCESS_LOG = os.path.join(base_data_dir, "access_log.json")
+GPS_LOG = os.path.join(base_data_dir, "gps_log.json")
+FACE_ENCODINGS_FILE = os.path.join(base_data_dir, "face_encodings.encrypted")
 ENCRYPTION_KEY = "CarBiometric2025SecureKey!@#"  # Keep the encryption key
+
+# Setup basic logging to a file inside the data folder for easier debugging
+LOG_DIR = os.path.join(base_data_dir, "logs")
+os.makedirs(LOG_DIR, exist_ok=True)
+logging.basicConfig(level=logging.INFO,
+                    format='%(asctime)s %(levelname)s %(message)s',
+                    handlers=[
+                        logging.FileHandler(os.path.join(LOG_DIR, 'server.log')),
+                        logging.StreamHandler()
+                    ])
+
+def log_exception(name: str, e: Exception):
+    tb = traceback.format_exc()
+    logging.error(f"{name} exception: {e}\n{tb}")
+    # Also write a short per-endpoint log for convenience
+    try:
+        with open(os.path.join(LOG_DIR, f"{name}.log"), 'a') as f:
+            f.write(f"[{datetime.now().isoformat()}] {e}\n{tb}\n")
+    except Exception:
+        pass
 
 # Initialize face detection
 cascade_file = 'haarcascade_frontalface_default.xml'
@@ -261,46 +305,88 @@ async def register_user(
         contents = await face_image.read()
         nparr = np.frombuffer(contents, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        
-        # Convert to RGB for face_recognition
-        rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        
-        # Detect faces using face_recognition
-        face_locations = face_recognition.face_locations(rgb_img)
-        if not face_locations:
-            raise HTTPException(status_code=400, detail="No face detected in image")
-        
-        # Get face encoding
-        face_encoding = face_recognition.face_encodings(rgb_img, face_locations)[0]
-        
-        # Save face image
+
+        if img is None:
+            raise HTTPException(status_code=400, detail="Could not decode uploaded image")
+
+        # Ensure face folder exists
         if not os.path.exists(FACE_FOLDER):
-            os.makedirs(FACE_FOLDER)
-            
+            os.makedirs(FACE_FOLDER, exist_ok=True)
+
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        filename = f"{FACE_FOLDER}/{name.replace(' ','_')}_{timestamp}.jpg"
-        cv2.imwrite(filename, img)
-        
-        # Save face encoding
-        encodings_db = SecurityModule.load_encrypted_file(FACE_ENCODINGS_FILE)
-        if not encodings_db:
-            encodings_db = {"encodings": []}
-        
-        # Save face encoding
-        encoding_record = {
-            "name": name,
-            "encoding": face_encoding.tolist(),  # Convert numpy array to list for JSON serialization
-            "file": filename,
-            "date_added": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        }
-        encodings_db["encodings"].append(encoding_record)
-        SecurityModule.save_encrypted_file(FACE_ENCODINGS_FILE, encodings_db)
-        
+        filename = os.path.join(FACE_FOLDER, f"{name.replace(' ','_')}_{timestamp}.jpg")
+
+        # If face_recognition is available, use it for encoding (preferred)
+        if FACE_RECOGNITION_AVAILABLE:
+            try:
+                # Convert to RGB for face_recognition
+                rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+
+                # Detect faces and compute encodings
+                face_locations = face_recognition.face_locations(rgb_img)
+                if not face_locations:
+                    raise HTTPException(status_code=400, detail="No face detected in image")
+
+                face_encoding = face_recognition.face_encodings(rgb_img, face_locations)[0]
+
+                # Save image and encoding
+                cv2.imwrite(filename, img)
+
+                encodings_db = SecurityModule.load_encrypted_file(FACE_ENCODINGS_FILE)
+                if not encodings_db:
+                    encodings_db = {"encodings": []}
+
+                encoding_record = {
+                    "name": name,
+                    "encoding": face_encoding.tolist(),
+                    "file": filename,
+                    "date_added": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "encoding_available": True
+                }
+                encodings_db["encodings"].append(encoding_record)
+                SecurityModule.save_encrypted_file(FACE_ENCODINGS_FILE, encodings_db)
+
+            except HTTPException:
+                raise
+            except Exception as inner_e:
+                print(f"Error during face_recognition processing: {inner_e}")
+                raise HTTPException(status_code=500, detail="Face processing failed")
+
+        else:
+            # Fallback: use OpenCV Haar cascade to detect a face and save the image.
+            # We can't compute a face encoding without face_recognition, but we
+            # can still register the user and store the raw image for later processing.
+            if face_cascade is None:
+                raise HTTPException(status_code=500, detail="Face recognition engine not available and no cascade fallback found")
+
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5)
+            if len(faces) == 0:
+                raise HTTPException(status_code=400, detail="No face detected in image (cascade fallback)")
+
+            # Save the original image (could also crop)
+            cv2.imwrite(filename, img)
+
+            encodings_db = SecurityModule.load_encrypted_file(FACE_ENCODINGS_FILE)
+            if not encodings_db:
+                encodings_db = {"encodings": []}
+
+            # Store a placeholder encoding record to keep the DB consistent
+            encoding_record = {
+                "name": name,
+                "encoding": [],
+                "file": filename,
+                "date_added": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "encoding_available": False
+            }
+            encodings_db["encodings"].append(encoding_record)
+            SecurityModule.save_encrypted_file(FACE_ENCODINGS_FILE, encodings_db)
+
         # Save user data
         users_db = SecurityModule.load_encrypted_file(USERS_DB)
         if users_db is None:
             users_db = {"users": []}
-            
+
         user_record = {
             "name": name,
             "driver_id": driver_id,
@@ -308,14 +394,20 @@ async def register_user(
             "vehicle_registration": vehicle_reg,
             "registered_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
             "status": "ACTIVE",
-            "face_file": filename
+            "face_file": filename,
+            "encoding_available": FACE_RECOGNITION_AVAILABLE
         }
         users_db["users"].append(user_record)
         SecurityModule.save_encrypted_file(USERS_DB, users_db)
-        
+
         return {"status": "success", "message": "User registered successfully"}
+    except HTTPException:
+        # Re-raise HTTP exceptions so FastAPI returns the intended status
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        # Log the exception for debugging and return a safe error message
+        print(f"Registration error: {e}")
+        raise HTTPException(status_code=500, detail="Registration failed: see server logs")
 
 @app.post("/api/verify-face")
 async def verify_face(face_image: UploadFile = File(...)):
@@ -324,57 +416,95 @@ async def verify_face(face_image: UploadFile = File(...)):
         contents = await face_image.read()
         nparr = np.frombuffer(contents, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
-        
-        # Convert image to RGB (face_recognition uses RGB)
-        rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-        
-        # Detect faces using face_recognition
-        face_locations = face_recognition.face_locations(rgb_img)
-        if not face_locations:
-            return {"status": "error", "message": "No face detected", "match_score": 0}
-        
-        # Get face encoding for the detected face
-        face_encoding = face_recognition.face_encodings(rgb_img, face_locations)[0]
-        
+
+        if img is None:
+            return {"status": "error", "message": "Could not decode uploaded image", "match_score": 0}
+
         # Load face encodings database
         encodings_db = SecurityModule.load_encrypted_file(FACE_ENCODINGS_FILE)
-        if not encodings_db:
+        if not encodings_db or not encodings_db.get("encodings"):
             return {"status": "error", "message": "No registered faces found", "match_score": 0}
-        
-        best_match_score = 0
-        best_match_name = None
-        
-        # Compare with all stored encodings
-        for user_data in encodings_db["encodings"]:
-            stored_encoding = np.array(user_data["encoding"])
-            # Compare faces and get distance
-            face_distance = face_recognition.face_distance([stored_encoding], face_encoding)[0]
-            # Convert distance to similarity score (0 distance = 1 score)
-            similarity_score = 1 - face_distance
-            
-            if similarity_score > best_match_score:
-                best_match_score = similarity_score
-                best_match_name = user_data["name"]
-        
-        # Load configuration for threshold
-        config = SecurityModule.load_encrypted_file(CONFIG_FILE)
-        threshold = config.get("recognition_threshold", 0.6) if config else 0.6
-        
-        if best_match_score >= threshold:
-            return {
-                "status": "success",
-                "message": "Face verified",
-                "match_score": best_match_score,
-                "user": best_match_name
-            }
-        else:
-            return {
-                "status": "error",
-                "message": "Face verification failed",
-                "match_score": best_match_score
-            }
+
+        # If face_recognition is available, use the accurate method
+        if FACE_RECOGNITION_AVAILABLE:
+            try:
+                rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                face_locations = face_recognition.face_locations(rgb_img)
+                if not face_locations:
+                    return {"status": "error", "message": "No face detected", "match_score": 0}
+
+                face_encoding = face_recognition.face_encodings(rgb_img, face_locations)[0]
+
+                best_match_score = 0
+                best_match_name = None
+                for user_data in encodings_db["encodings"]:
+                    if not user_data.get("encoding"):
+                        continue
+                    stored_encoding = np.array(user_data["encoding"])
+                    face_distance = face_recognition.face_distance([stored_encoding], face_encoding)[0]
+                    similarity_score = 1 - face_distance
+                    if similarity_score > best_match_score:
+                        best_match_score = similarity_score
+                        best_match_name = user_data["name"]
+
+                config = SecurityModule.load_encrypted_file(CONFIG_FILE)
+                threshold = config.get("recognition_threshold", 0.6) if config else 0.6
+
+                if best_match_score >= threshold:
+                    return {"status": "success", "message": "Face verified", "match_score": best_match_score, "user": best_match_name}
+                else:
+                    return {"status": "error", "message": "Face verification failed", "match_score": best_match_score}
+            except Exception as e:
+                log_exception('verify_face', e)
+                return {"status": "error", "message": "Face verification error", "match_score": 0}
+
+        # Fallback simple verification using histogram correlation when face_recognition is not available
+        try:
+            def hist_similarity(a, b):
+                # compute HSV histogram similarity (correlation) scaled to 0..1
+                hsv_a = cv2.cvtColor(a, cv2.COLOR_BGR2HSV)
+                hsv_b = cv2.cvtColor(b, cv2.COLOR_BGR2HSV)
+                hist_a = cv2.calcHist([hsv_a], [0,1], None, [50,60], [0,180,0,256])
+                hist_b = cv2.calcHist([hsv_b], [0,1], None, [50,60], [0,180,0,256])
+                cv2.normalize(hist_a, hist_a)
+                cv2.normalize(hist_b, hist_b)
+                score = cv2.compareHist(hist_a, hist_b, cv2.HISTCMP_CORREL)
+                # correlation can be in [-1,1], clamp and scale
+                score = max(min(score, 1.0), -1.0)
+                return (score + 1.0) / 2.0
+
+            best_score = 0
+            best_name = None
+            for user_data in encodings_db["encodings"]:
+                file_path = user_data.get("file")
+                if not file_path or not os.path.exists(file_path):
+                    continue
+                try:
+                    stored = cv2.imread(file_path)
+                    if stored is None:
+                        continue
+                    # Resize both to a comparable size to reduce scale effects
+                    stored_rs = cv2.resize(stored, (300,300))
+                    probe_rs = cv2.resize(img, (300,300))
+                    score = hist_similarity(stored_rs, probe_rs)
+                    if score > best_score:
+                        best_score = score
+                        best_name = user_data.get("name")
+                except Exception as inner:
+                    logging.warning(f"Failed similarity for {file_path}: {inner}")
+
+            # Threshold: convert histogram score to 0..1; pick threshold 0.5 as baseline
+            threshold = 0.5
+            if best_score >= threshold:
+                return {"status": "success", "message": "Face verified (histogram fallback)", "match_score": best_score, "user": best_name}
+            else:
+                return {"status": "error", "message": "Face verification failed (histogram)", "match_score": best_score}
+        except Exception as e:
+            log_exception('verify_face_fallback', e)
+            return {"status": "error", "message": "Verification error", "match_score": 0}
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        log_exception('verify_face_outer', e)
+        return {"status": "error", "message": "Unexpected verification error", "match_score": 0}
 
 @app.post("/api/verify-pin")
 async def verify_pin(pin: str):
