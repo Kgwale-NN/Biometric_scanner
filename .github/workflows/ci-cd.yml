@@ -10,40 +10,53 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/checkout@v2
-    
-    - name: Set up Python
-      uses: actions/setup-python@v2
-      with:
-        python-version: '3.8'
-        
-    - name: Install dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install -r requirements.txt
-        
-    - name: Run tests
-      run: |
-        python -m pytest
+      - uses: actions/checkout@v3
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.11'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run tests
+        run: |
+          python -m pytest
 
   deploy:
     needs: test
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master'
-    
+
     steps:
-    - name: Checkout
-      uses: actions/checkout@v2
-      
-    - name: Use Node.js
-      uses: actions/setup-node@v2
-      with:
-        node-version: '16'
-        
-    - name: Install Railway
-      run: npm i -g @railway/cli
-      
-    - name: Deploy to Railway
-      run: railway up
-      env:
-        RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+      - name: Checkout
+        uses: actions/checkout@v3
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '20'
+
+      - name: Sanity: list repo and static files
+        run: |
+          echo "Listing repo root:"
+          ls -la
+          echo "\nListing api folder:"
+          ls -la api || true
+          echo "\nListing api/static (if present):"
+          ls -la api/static || echo 'api/static not present'
+
+      - name: Install Railway CLI
+        run: |
+          npm ci --prefix .
+          npm install -g @railway/cli
+
+      - name: Deploy to Railway (non-interactive)
+        env:
+          RAILWAY_TOKEN: ${{ secrets.RAILWAY_TOKEN }}
+        run: |
+          # Non-interactive deployment; requires RAILWAY_TOKEN secret
+          railway up --detach

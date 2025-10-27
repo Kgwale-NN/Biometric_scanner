@@ -1,6 +1,7 @@
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
+from pathlib import Path
 import cv2
 import numpy as np
 import base64
@@ -22,9 +23,14 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Serve the built frontend (Vite build) from the `api/static` folder.
-# The Dockerfile copies the frontend `dist` into `api/static` at build time.
-app.mount("/", StaticFiles(directory="api/static", html=True), name="static")
+# Serve the built frontend (Vite build) from the `static` folder next to this file.
+# The Dockerfile copies the frontend `dist` into the backend static folder at build time.
+static_dir = Path(__file__).resolve().parent / "static"
+if static_dir.exists():
+    app.mount("/", StaticFiles(directory=str(static_dir), html=True), name="static")
+else:
+    # Don't crash if static files are not present during local development — warn instead
+    print(f"Warning: Static directory '{static_dir}' does not exist. Frontend static files will not be served by the backend.")
 
 # --- DYNAMIC CORS ---
 API_URL = os.getenv("VITE_API_URL", "http://localhost:5173")
@@ -52,7 +58,9 @@ possible_paths = [
     os.path.join(cv2.__file__, '..', '..', 'data', cascade_file),
     os.path.join(cv2.__file__, '..', 'data', cascade_file),
     os.path.join(os.path.dirname(cv2.__file__), 'data', cascade_file),
-    cascade_file  # Try direct file if it's in current directory
+    cascade_file,  # Try direct file if it's in current directory
+    # Also try the file bundled next to this module (api/haarcascade_frontalface_default.xml)
+    os.path.join(os.path.dirname(__file__), cascade_file),
 ]
 
 face_cascade = None
@@ -64,6 +72,8 @@ for cascade_path in possible_paths:
 
 if face_cascade is None:
     print("Warning: Could not find face cascade file. Face detection may not work.")
+    print("Suggestion: ensure 'haarcascade_frontalface_default.xml' is present in the 'api/' folder or in OpenCV data directories.")
+    print("You can copy the file into api/ from OpenCV (if installed) or download it from: https://github.com/opencv/opencv/tree/master/data/haarcascades")
 
 # Try to import face_recognition, fall back to basic detection if not available
 try:
@@ -73,6 +83,12 @@ try:
 except ImportError:
     FACE_RECOGNITION_AVAILABLE = False
     print(" face_recognition not available, using basic OpenCV detection")
+    print("To enable face_recognition (recommended for better accuracy) consider installing it in a conda environment:")
+    print("  conda create -n biometric python=3.11 -y")
+    print("  conda activate biometric")
+    print("  conda install -c conda-forge dlib face_recognition cmake -y")
+    print("Or try (may require build tools) using pip in WSL or a suitable environment:")
+    print("  pip install cmake dlib face_recognition")
 
 def initialize_database():
     """Initialize all database files on startup"""

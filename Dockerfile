@@ -40,7 +40,7 @@ RUN pip install --no-cache-dir gunicorn && \
 
 COPY --from=backend /app/server /app/server
 COPY --from=backend /usr/share/opencv4/haarcascades /usr/share/opencv4/haarcascades
-COPY --from=frontend /app/client/dist /app/static
+COPY --from=frontend /app/client/dist /app/server/static
 COPY nginx.conf /etc/nginx/sites-enabled/default
 
 ENV PYTHONPATH=/app/server

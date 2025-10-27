@@ -1,51 +1,12 @@
-name: Deploy Biometric Scanner
+name: deploy-removed
 
 on:
-  push:
-    branches: [ main ]
-  pull_request:
-    branches: [ main ]
+  workflow_dispatch: {}
 
 jobs:
-  build-and-deploy:
+  noop:
     runs-on: ubuntu-latest
-
     steps:
-    - uses: actions/checkout@v2
-
-    # Setup Python
-    - name: Set up Python
-      uses: actions/setup-python@v2
-      with:
-        python-version: '3.12'
-
-    # Install Python dependencies
-    - name: Install Python dependencies
-      run: |
-        python -m pip install --upgrade pip
-        pip install -r requirements.txt
-
-    # Setup Node
-    - name: Setup Node.js
-      uses: actions/setup-node@v2
-      with:
-        node-version: '20'
-
-    # Install and build frontend
-    - name: Install and Build Frontend
-      run: |
-        npm install
-        npm run build
-
-    # Run tests (when you add them)
-    # - name: Run tests
-    #   run: |
-    #     npm test
-    #     python -m pytest
-
-    # Deploy (you'll need to configure this based on your hosting platform)
-    - name: Deploy
-      uses: peaceiris/actions-gh-pages@v3
-      with:
-        github_token: ${{ secrets.GITHUB_TOKEN }}
-        publish_dir: ./dist
+      - name: Placeholder - no operation
+        run: |
+          echo "This workflow is intentionally disabled. Deployment is handled by ci-cd.yml"
