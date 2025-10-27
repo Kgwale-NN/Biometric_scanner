@@ -1,0 +1,31 @@
+# Version control
+.git
+.gitignore
+
+# Dependencies
+node_modules
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+
+# Environment
+.env
+.env.*
+venv
+env
+
+# Development
+README.md
+*.md
+*.log
+.vscode
+
+# Data directories
+data/*
+!data/biometric_faces/.gitkeep
+
+# Build artifacts
+dist
+build
+*.egg-info

@@ -26,14 +26,24 @@ app.add_middleware(
 # The Dockerfile copies the frontend `dist` into `api/static` at build time.
 app.mount("/", StaticFiles(directory="api/static", html=True), name="static")
 
-# Constants
-FACE_FOLDER = "biometric_faces"
-USERS_DB = "users_database.encrypted"
-CONFIG_FILE = "system_config.encrypted"
-ACCESS_LOG = "access_log.json"
-GPS_LOG = "gps_log.json"
-ENCRYPTION_KEY = "CarBiometric2025SecureKey!@#"
-FACE_ENCODINGS_FILE = "face_encodings.encrypted"
+# --- DYNAMIC CORS ---
+API_URL = os.getenv("VITE_API_URL", "http://localhost:5173")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["http://localhost:5173", API_URL],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# --- PERSISTENT DATA PATHS ---
+FACE_FOLDER = "/app/data/biometric_faces"
+USERS_DB = "/app/data/users_database.encrypted"
+CONFIG_FILE = "/app/data/system_config.encrypted"
+ACCESS_LOG = "/app/data/access_log.json"
+GPS_LOG = "/app/data/gps_log.json"
+FACE_ENCODINGS_FILE = "/app/data/face_encodings.encrypted"
+ENCRYPTION_KEY = "CarBiometric2025SecureKey!@#"  # Keep the encryption key
 
 # Initialize face detection
 cascade_file = 'haarcascade_frontalface_default.xml'

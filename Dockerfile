@@ -1,40 +1,50 @@
-# Multi-stage Dockerfile for a monorepo: build the Vite frontend then build/run the Python FastAPI backend
+# ---------- 1. Build Frontend ----------
+FROM node:20-alpine AS frontend
+WORKDIR /app/client
 
-# ---------- Stage 1: Build frontend ----------
-FROM node:20-alpine AS node-build
-WORKDIR /workspace/frontend
-
-# Install dependencies (copy only package files first for better caching)
-COPY package*.json tsconfig*.json vite.config.ts ./
-RUN npm ci
+# Install dependencies
+COPY package*.json tsconfig*.json vite.config.ts components.json ./
+RUN npm ci --omit=dev
 
 # Copy source and build
 COPY . .
 ENV NODE_ENV=production
 RUN npm run build
 
+# ---------- 2. Build Backend ----------
+FROM python:3.11-slim AS backend
+WORKDIR /app/server
 
-# ---------- Stage 2: Build runtime image (Python) ----------
-FROM python:3.11-slim AS runtime
+# Install system deps for dlib + OpenCV
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential cmake libopenblas-dev liblapack-dev libx11-dev \
+    libgtk-3-dev libboost-python-dev libatlas-base-dev libjpeg-dev \
+    zlib1g-dev libpng-dev && rm -rf /var/lib/apt/lists/*
+
+COPY api/requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+COPY api/ .
+
+# Copy Haar cascade
+RUN mkdir -p /usr/share/opencv4/haarcascades && \
+    cp $(python -c "import cv2, pathlib; print(pathlib.Path(cv2._file_).parent/'data'/'haarcascade_frontalface_default.xml')") \
+       /usr/share/opencv4/haarcascades/
+
+# ---------- 3. Final Runtime ----------
+FROM python:3.11-slim
 WORKDIR /app
 
-# System dependencies needed for opencv/dlib/face-recognition and general builds
-RUN apt-get update \
-	&& apt-get install -y --no-install-recommends build-essential cmake libglib2.0-0 libsm6 libxext6 libxrender1 libgl1 git curl \
-	&& rm -rf /var/lib/apt/lists/*
+RUN pip install --no-cache-dir gunicorn && \
+    apt-get update && apt-get install -y --no-install-recommends nginx && \
+    rm -rf /var/lib/apt/lists/*
 
-# Copy and install Python dependencies
-COPY requirements.txt ./
-RUN pip install --no-cache-dir -r requirements.txt
+COPY --from=backend /app/server /app/server
+COPY --from=backend /usr/share/opencv4/haarcascades /usr/share/opencv4/haarcascades
+COPY --from=frontend /app/client/dist /app/static
+COPY nginx.conf /etc/nginx/sites-enabled/default
 
-# Copy backend source
-COPY api ./api
+ENV PYTHONPATH=/app/server
+VOLUME /app/data
+EXPOSE 80
 
-# Copy built frontend assets into backend static folder
-COPY --from=node-build /workspace/frontend/dist ./api/static
-
-ENV PORT=3000
-EXPOSE 3000
-
-# Use gunicorn with uvicorn worker for production-grade serving
-CMD ["gunicorn", "api.server:app", "--workers", "4", "--worker-class", "uvicorn.workers.UvicornWorker", "--bind", "0.0.0.0:$PORT"]
+CMD ["sh", "-c", "gunicorn -w 4 -k uvicorn.workers.UvicornWorker server.server:app --bind 0.0.0.0:8000 & nginx -g 'daemon off;'"]
