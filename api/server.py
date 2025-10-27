@@ -1,17 +1,40 @@
+import os
+import json
+import base64
+import hashlib
+import logging
+import traceback
+from datetime import datetime
+from pathlib import Path
+from typing import Optional
+
+import cv2
+import numpy as np
+import firebase_admin
+from firebase_admin import credentials, firestore, storage
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
-from pathlib import Path
-import cv2
-import numpy as np
-import base64
-import json
-from datetime import datetime
-import os
-from typing import Optional
-import hashlib
-import traceback
-import logging
+
+# --- Firebase Initialization ---
+# This assumes Application Default Credentials (ADC) are available.
+# In Cloud Run, this is automatically handled by the service account.
+# Locally, you might need `gcloud auth application-default login` or
+# set the GOOGLE_APPLICATION_CREDENTIALS environment variable.
+try:
+    firebase_admin.initialize_app()
+    db = firestore.client()
+    gcs_bucket_name = os.environ.get("GCS_BUCKET_NAME")
+    if not gcs_bucket_name:
+        raise ValueError("GCS_BUCKET_NAME environment variable not set.")
+    gcs_bucket = storage.bucket(name=gcs_bucket_name)
+    logging.info(f"Firebase initialized. Firestore client ready. GCS bucket: {gcs_bucket_name}")
+except Exception as e:
+    logging.error(f"Failed to initialize Firebase: {e}")
+    # Exit or raise error if Firebase is crucial and cannot be initialized
+    # For now, we'll let it try to proceed, but operations will fail.
+    db = None
+    gcs_bucket = None
 
 # Initialize FastAPI app
 app = FastAPI(title="Biometric Car Security API")
@@ -32,7 +55,7 @@ if static_dir.exists():
     app.mount("/", StaticFiles(directory=str(static_dir), html=True), name="static")
 else:
     # Don't crash if static files are not present during local development — warn instead
-    print(f"Warning: Static directory '{static_dir}' does not exist. Frontend static files will not be served by the backend.")
+    logging.warning(f"Static directory '{static_dir}' does not exist. Frontend static files will not be served by the backend.")
 
 # --- DYNAMIC CORS ---
 API_URL = os.getenv("VITE_API_URL", "http://localhost:5173")
@@ -44,252 +67,237 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# --- PERSISTENT DATA PATHS ---
-# Data paths -- prefer a Docker-friendly absolute path when available, but
-# fall back to a repo-local path for local development (so files you drop
-# into api/biometric_faces are visible to the running server).
-DEFAULT_DATA_DIR = "/app/data"
-MODULE_PATH = Path(__file__).resolve().parent
-MODULE_DATA_DIR = MODULE_PATH / "data"
-MODULE_BIOMETRIC_DIR = MODULE_PATH / "biometric_faces"
+# --- PERSISTENT DATA HANDLED BY FIRESTORE & CLOUD STORAGE ---
+# Remove local file paths and rely on Firestore collections and GCS paths
+ENCRYPTION_KEY = os.environ.get("ENCRYPTION_KEY")
+if not ENCRYPTION_KEY:
+    logging.error("ENCRYPTION_KEY environment variable not set. PIN verification will fail.")
+    ENCRYPTION_KEY = "DEFAULT_UNSECURE_KEY" # Fallback for local testing, DO NOT USE IN PROD
 
-# Priority: explicit FACE_FOLDER env -> /app/data (Docker) -> repo/api/biometric_faces -> repo/api/data -> repo/api/data (create)
-env_face_folder = os.getenv("FACE_FOLDER")
-if env_face_folder:
-    base_data_dir = env_face_folder
-elif os.path.exists(DEFAULT_DATA_DIR):
-    base_data_dir = DEFAULT_DATA_DIR
-elif MODULE_BIOMETRIC_DIR.exists():
-    base_data_dir = str(MODULE_PATH)
-elif MODULE_DATA_DIR.exists():
-    base_data_dir = str(MODULE_DATA_DIR)
-else:
-    # Default local data dir (will be created if needed)
-    base_data_dir = str(MODULE_DATA_DIR)
-
-FACE_FOLDER = os.path.join(base_data_dir, "biometric_faces")
-USERS_DB = os.path.join(base_data_dir, "users_database.encrypted")
-CONFIG_FILE = os.path.join(base_data_dir, "system_config.encrypted")
-ACCESS_LOG = os.path.join(base_data_dir, "access_log.json")
-GPS_LOG = os.path.join(base_data_dir, "gps_log.json")
-FACE_ENCODINGS_FILE = os.path.join(base_data_dir, "face_encodings.encrypted")
-ENCRYPTION_KEY = "CarBiometric2025SecureKey!@#"  # Keep the encryption key
-
-# Setup basic logging to a file inside the data folder for easier debugging
-LOG_DIR = os.path.join(base_data_dir, "logs")
-os.makedirs(LOG_DIR, exist_ok=True)
+# Setup basic logging
 logging.basicConfig(level=logging.INFO,
                     format='%(asctime)s %(levelname)s %(message)s',
                     handlers=[
-                        logging.FileHandler(os.path.join(LOG_DIR, 'server.log')),
                         logging.StreamHandler()
                     ])
 
 def log_exception(name: str, e: Exception):
     tb = traceback.format_exc()
     logging.error(f"{name} exception: {e}\n{tb}")
-    # Also write a short per-endpoint log for convenience
-    try:
-        with open(os.path.join(LOG_DIR, f"{name}.log"), 'a') as f:
-            f.write(f"[{datetime.now().isoformat()}] {e}\n{tb}\n")
-    except Exception:
-        pass
 
 # Initialize face detection
 cascade_file = 'haarcascade_frontalface_default.xml'
-# Try multiple possible paths for the Haar cascade file
-possible_paths = [
-    os.path.join(cv2.__file__, '..', '..', 'data', cascade_file),
-    os.path.join(cv2.__file__, '..', 'data', cascade_file),
-    os.path.join(os.path.dirname(cv2.__file__), 'data', cascade_file),
-    cascade_file,  # Try direct file if it's in current directory
-    # Also try the file bundled next to this module (api/haarcascade_frontalface_default.xml)
-    os.path.join(os.path.dirname(__file__), cascade_file),
-]
+# The Dockerfile ensures this is copied to /usr/share/opencv4/haarcascades
+# We can reference it directly or ensure it's in the current working directory or a known path.
+# For Cloud Run, it's safer to use the path we explicitly copied to in the Dockerfile.
+HAARCASCADE_PATH = '/usr/share/opencv4/haarcascades/haarcascade_frontalface_default.xml'
 
 face_cascade = None
-for cascade_path in possible_paths:
-    if os.path.exists(cascade_path):
-        face_cascade = cv2.CascadeClassifier(cascade_path)
-        print(f"Found cascade file at: {cascade_path}")
-        break
+if os.path.exists(HAARCASCADE_PATH):
+    face_cascade = cv2.CascadeClassifier(HAARCASCADE_PATH)
+    logging.info(f"Found cascade file at: {HAARCASCADE_PATH}")
+else:
+    logging.warning(f"Could not find face cascade file at {HAARCASCADE_PATH}. Face detection may not work.")
+    logging.warning("Suggestion: ensure 'haarcascade_frontalface_default.xml' is present in the 'api/' folder and Dockerfile correctly copies it.")
 
-if face_cascade is None:
-    print("Warning: Could not find face cascade file. Face detection may not work.")
-    print("Suggestion: ensure 'haarcascade_frontalface_default.xml' is present in the 'api/' folder or in OpenCV data directories.")
-    print("You can copy the file into api/ from OpenCV (if installed) or download it from: https://github.com/opencv/opencv/tree/master/data/haarcascades")
-
-# Try to import face_recognition. If unavailable, set a flag and continue so the
-# FastAPI app can start. Endpoints that require face_recognition will return a
-# clear 501 response asking the user to install the optional dependency.
+# Try to import face_recognition.
 try:
     import face_recognition
     FACE_RECOGNITION_AVAILABLE = True
-    print("face_recognition library loaded")
+    logging.info("face_recognition library loaded")
 except ImportError:
     FACE_RECOGNITION_AVAILABLE = False
-    print("face_recognition not available. Endpoints that require face recognition will return an informative error.")
-    print("To enable face_recognition (note: this often requires compiling dlib or using conda):")
-    print("  (recommended) install with conda: conda install -c conda-forge dlib face_recognition cmake")
-    print("  or in an environment with build tools try: pip install cmake dlib face_recognition")
+    logging.warning("face_recognition not available. Endpoints that require face recognition will return an informative error.")
 
-def initialize_database():
-    """Initialize all database files on startup"""
-    print("\n" + "="*60)
-    print("   INITIALIZING DATABASE")
-    print("="*60)
-    
-    # Create folders
-    if not os.path.exists(FACE_FOLDER):
-        os.makedirs(FACE_FOLDER)
-        print(f" Created folder: {FACE_FOLDER}")
-    
-    # Initialize Users Database
-    if not os.path.exists(USERS_DB):
-        users_data = {"users": []}
-        SecurityModule.save_encrypted_file(USERS_DB, users_data)
-        print(f" Created: {USERS_DB}")
-    else:
-        print(f"✓ Found: {USERS_DB}")
-    
-    # Initialize Face Encodings Database
-    if not os.path.exists(FACE_ENCODINGS_FILE):
-        encodings_data = {"encodings": []}
-        SecurityModule.save_encrypted_file(FACE_ENCODINGS_FILE, encodings_data)
-        print(f" Created: {FACE_ENCODINGS_FILE}")
-    else:
-        print(f"✓ Found: {FACE_ENCODINGS_FILE}")
-    
-    # Initialize Config File
-    if not os.path.exists(CONFIG_FILE):
+async def initialize_firebase_data():
+    """Initialize default Firebase collections/documents on startup."""
+    logging.info("\n" + "="*60)
+    logging.info("   INITIALIZING FIREBASE DATA")
+    logging.info("="*60)
+
+    if not db:
+        logging.error("Firestore client not initialized. Skipping data initialization.")
+        return
+    if not gcs_bucket:
+        logging.error("GCS bucket not initialized. Skipping data initialization.")
+        return
+
+    # Initialize Config Document (in 'settings' collection)
+    config_ref = db.collection('settings').document('system_config')
+    config_doc = await config_ref.get()
+    if not config_doc.exists:
         config_data = {
-            "emergency_pin": hashlib.sha256("1234".encode()).hexdigest(),
+            "emergency_pin_hash": hashlib.sha256("1234".encode()).hexdigest(), # Stored as hash
             "recognition_threshold": 0.6,
-            "system_version": "3.0-SECURE",
+            "system_version": "3.0-SECURE-F", # F for Firebase
             "engine_computer_enabled": True,
-            "gps_tracking_enabled": True
+            "gps_tracking_enabled": True,
+            "last_updated": firestore.SERVER_TIMESTAMP
         }
-        SecurityModule.save_encrypted_file(CONFIG_FILE, config_data)
-        print(f" Created: {CONFIG_FILE}")
-        print(f"   Default Emergency PIN: 1234")
+        await config_ref.set(config_data)
+        logging.info(f" Created config: settings/system_config (Default Emergency PIN: 1234)")
     else:
-        print(f"✓ Found: {CONFIG_FILE}")
-    
-    # Initialize Access Log
-    if not os.path.exists(ACCESS_LOG):
-        with open(ACCESS_LOG, 'w') as f:
-            json.dump({"logs": []}, f, indent=4)
-        print(f" Created: {ACCESS_LOG}")
+        logging.info("✓ Found config: settings/system_config")
+
+    # Initialize Users Collection (empty if not exists)
+    # Firestore creates collections implicitly on first document write.
+    # We just log a check here.
+    users_collection_ref = db.collection('users')
+    first_user = await users_collection_ref.limit(1).get()
+    if not first_user:
+        logging.info(" Users collection ready (will be created on first user registration).")
     else:
-        print(f"✓ Found: {ACCESS_LOG}")
-    
-    # Initialize GPS Log
-    if not os.path.exists(GPS_LOG):
-        with open(GPS_LOG, 'w') as f:
-            json.dump({"gps_history": []}, f, indent=4)
-        print(f" Created: {GPS_LOG}")
+        logging.info("✓ Users collection found.")
+
+    # Initialize Access Logs Collection
+    access_logs_collection_ref = db.collection('access_logs')
+    first_log = await access_logs_collection_ref.limit(1).get()
+    if not first_log:
+        logging.info(" Access logs collection ready.")
     else:
-        print(f"✓ Found: {GPS_LOG}")
-    
-    print("\n Database initialization complete!")
-    print("="*60 + "\n")
+        logging.info("✓ Access logs collection found.")
+
+    # Initialize GPS Logs Collection
+    gps_logs_collection_ref = db.collection('gps_logs')
+    first_gps = await gps_logs_collection_ref.limit(1).get()
+    if not first_gps:
+        logging.info(" GPS logs collection ready.")
+    else:
+        logging.info("✓ GPS logs collection found.")
+
+    # Check/Create Cloud Storage bucket (Firebase Storage already guarantees this)
+    try:
+        gcs_bucket.blob("test_path/test_file.txt").exists() # Simple check for bucket access
+        logging.info(f"✓ GCS Bucket '{gcs_bucket_name}' accessible.")
+    except Exception as e:
+        logging.error(f"GCS Bucket '{gcs_bucket_name}' is not accessible: {e}")
+
+
+    logging.info("\n Firebase data initialization complete!")
+    logging.info("="*60 + "\n")
 
 # Initialize on startup
 @app.on_event("startup")
 async def startup_event():
-    initialize_database()
+    await initialize_firebase_data()
 
-def log_access(user_name: str, action: str, status: str, method: str, match_score: float = 0):
-    """Log access attempts"""
+async def log_access(user_name: str, action: str, status: str, method: str, match_score: float = 0):
+    """Log access attempts to Firestore."""
+    if not db:
+        logging.error("Firestore client not initialized. Cannot log access.")
+        return
+
     try:
-        with open(ACCESS_LOG, 'r') as f:
-            logs = json.load(f)
-        
         log_entry = {
-            "timestamp": datetime.now().isoformat(),
+            "timestamp": datetime.now(), # Firestore native timestamp
             "user": user_name,
             "action": action,
             "status": status,
             "method": method,
-            "match_score": f"{match_score:.1%}" if match_score > 0 else "N/A",
-            "gps_location": "Johannesburg, SA",
+            "match_score": float(f"{match_score:.4f}") if match_score > 0 else 0.0,
+            "gps_location": "Johannesburg, SA", # Placeholder, ideally dynamic
             "engine_status": "ENABLED" if status == "GRANTED" else "LOCKED"
         }
-        
-        logs["logs"].append(log_entry)
-        
-        with open(ACCESS_LOG, 'w') as f:
-            json.dump(logs, f, indent=4)
-        
-        print(f" Logged: {action} - {status} - {user_name}")
+        await db.collection('access_logs').add(log_entry)
+        logging.info(f" Logged: {action} - {status} - {user_name}")
     except Exception as e:
-        print(f" Log error: {e}")
+        log_exception("log_access", e)
 
-def update_gps(latitude: float = -26.2041, longitude: float = 28.0473):
-    """Update GPS location"""
+async def update_gps(latitude: float = -26.2041, longitude: float = 28.0473):
+    """Update GPS location in Firestore."""
+    if not db:
+        logging.error("Firestore client not initialized. Cannot update GPS.")
+        return
+
     try:
-        with open(GPS_LOG, 'r') as f:
-            gps_data = json.load(f)
-        
         location = {
             "latitude": latitude,
             "longitude": longitude,
             "address": "Johannesburg, Gauteng, South Africa",
-            "timestamp": datetime.now().isoformat()
+            "timestamp": datetime.now()
         }
-        
-        gps_data["gps_history"].append(location)
-        
-        # Keep only last 100 locations
-        if len(gps_data["gps_history"]) > 100:
-            gps_data["gps_history"] = gps_data["gps_history"][-100:]
-        
-        with open(GPS_LOG, 'w') as f:
-            json.dump(gps_data, f, indent=4)
+        await db.collection('gps_logs').add(location)
+        # We'll rely on Firestore queries for retrieving recent logs,
+        # rather than managing a fixed-size list here.
     except Exception as e:
-        print(f" GPS error: {e}")
+        log_exception("update_gps", e)
 
 class SecurityModule:
+    # This encryption is primarily for hashing PINs for storage.
+    # General data encryption/decryption is less relevant now that we're using Firestore
+    # with its own security rules.
     @staticmethod
-    def encrypt_data(data):
-        try:
-            key = ENCRYPTION_KEY.encode()
-            data_bytes = data.encode() if isinstance(data, str) else data
-            encrypted = bytearray()
-            for i, byte in enumerate(data_bytes):
-                encrypted.append(byte ^ key[i % len(key)])
-            return base64.b64encode(bytes(encrypted)).decode()
-        except:
-            return None
+    def hash_pin(pin: str) -> str:
+        if not ENCRYPTION_KEY:
+            logging.error("ENCRYPTION_KEY not set. Hashing with default key.")
+        return hashlib.sha256((pin + ENCRYPTION_KEY).encode()).hexdigest()
+
+    # --- Firestore Operations ---
+    @staticmethod
+    async def get_system_config():
+        if not db: return None
+        config_doc = await db.collection('settings').document('system_config').get()
+        return config_doc.to_dict() if config_doc.exists else None
 
     @staticmethod
-    def decrypt_data(encrypted_data):
-        try:
-            key = ENCRYPTION_KEY.encode()
-            data_bytes = base64.b64decode(encrypted_data)
-            decrypted = bytearray()
-            for i, byte in enumerate(data_bytes):
-                decrypted.append(byte ^ key[i % len(key)])
-            return bytes(decrypted).decode()
-        except:
-            return None
+    async def get_all_users():
+        if not db: return []
+        users_stream = db.collection('users').stream()
+        return [user.to_dict() for user in users_stream]
 
     @staticmethod
-    def load_encrypted_file(filename):
-        try:
-            with open(filename, 'r') as f:
-                encrypted = f.read()
-            decrypted = SecurityModule.decrypt_data(encrypted)
-            return json.loads(decrypted)
-        except:
-            return None
+    async def get_user_by_driver_id(driver_id: str):
+        if not db: return None
+        users_ref = db.collection('users')
+        query = users_ref.where('driver_id', '==', driver_id).limit(1)
+        user_docs = await query.get()
+        if user_docs:
+            return user_docs[0].to_dict()
+        return None
 
     @staticmethod
-    def save_encrypted_file(filename, data):
-        json_str = json.dumps(data)
-        encrypted = SecurityModule.encrypt_data(json_str)
-        with open(filename, 'w') as f:
-            f.write(encrypted)
+    async def add_user(user_data: dict):
+        if not db: return None
+        # Use driver_id as document ID for easier retrieval and to ensure uniqueness
+        doc_ref = db.collection('users').document(user_data['driver_id'])
+        await doc_ref.set(user_data)
+        return {"id": doc_ref.id}
+
+    @staticmethod
+    async def update_user(driver_id: str, updates: dict):
+        if not db: return None
+        doc_ref = db.collection('users').document(driver_id)
+        await doc_ref.update(updates)
+
+    # --- Cloud Storage Operations ---
+    @staticmethod
+    async def upload_face_image(image_bytes: bytes, user_id: str, timestamp: str):
+        if not gcs_bucket: return None
+        # Store images in a 'face_images' folder within the bucket
+        blob_name = f"face_images/{user_id}_{timestamp}.jpg"
+        blob = gcs_bucket.blob(blob_name)
+        blob.upload_from_string(image_bytes, content_type='image/jpeg')
+        # Make the blob publicly accessible if your Firestore security rules allow it
+        # or if your app downloads directly. Consider signed URLs for better security.
+        blob.make_public()
+        return blob.public_url
+
+    @staticmethod
+    async def download_face_image(public_url: str) -> Optional[bytes]:
+        if not gcs_bucket: return None
+        try:
+            # You might need to parse the blob name from the public_url
+            # For simplicity, if we know the blob name, we can use that directly
+            # Or make a request to the public_url
+            # For now, let's assume we can retrieve from a public URL directly
+            import httpx
+            async with httpx.AsyncClient() as client:
+                response = await client.get(public_url)
+                response.raise_for_status()
+                return response.content
+        except Exception as e:
+            logging.error(f"Failed to download image from {public_url}: {e}")
+            return None
 
 @app.post("/api/register")
 async def register_user(
@@ -299,12 +307,17 @@ async def register_user(
     vehicle_reg: str,
     face_image: UploadFile = File(...)
 ):
-    # Ensure face_recognition is available before attempting registration
     if not FACE_RECOGNITION_AVAILABLE:
         raise HTTPException(status_code=501, detail="face_recognition package is not installed. Install it to use face registration endpoints.")
+    if not db or not gcs_bucket:
+        raise HTTPException(status_code=500, detail="Firebase services not initialized.")
 
     try:
-        # Read and process the uploaded image
+        # Check if user already exists
+        existing_user = await SecurityModule.get_user_by_driver_id(driver_id)
+        if existing_user:
+            raise HTTPException(status_code=400, detail=f"User with Driver ID {driver_id} already exists.")
+
         contents = await face_image.read()
         nparr = np.frombuffer(contents, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
@@ -312,113 +325,54 @@ async def register_user(
         if img is None:
             raise HTTPException(status_code=400, detail="Could not decode uploaded image")
 
-        # Ensure face folder exists
-        if not os.path.exists(FACE_FOLDER):
-            os.makedirs(FACE_FOLDER, exist_ok=True)
-
         timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
-        filename = os.path.join(FACE_FOLDER, f"{name.replace(' ','_')}_{timestamp}.jpg")
+        face_image_url = await SecurityModule.upload_face_image(contents, driver_id, timestamp)
+        if not face_image_url:
+            raise HTTPException(status_code=500, detail="Failed to upload face image to Cloud Storage.")
 
-        # If face_recognition is available, use it for encoding (preferred)
+        face_encoding_list = []
         if FACE_RECOGNITION_AVAILABLE:
             try:
-                # Convert to RGB for face_recognition
                 rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
-
-                # Detect faces and compute encodings
                 face_locations = face_recognition.face_locations(rgb_img)
                 if not face_locations:
-                    raise HTTPException(status_code=400, detail="No face detected in image")
+                    # Allow registration without encoding if no face detected by face_recognition
+                    # but set encoding_available to False
+                    logging.warning(f"No face detected by face_recognition for {name}, proceeding without encoding.")
+                else:
+                    face_encoding_list = face_recognition.face_encodings(rgb_img, face_locations)[0].tolist()
 
-                face_encoding = face_recognition.face_encodings(rgb_img, face_locations)[0]
-
-                # Save image and encoding
-                cv2.imwrite(filename, img)
-
-                encodings_db = SecurityModule.load_encrypted_file(FACE_ENCODINGS_FILE)
-                if not encodings_db:
-                    encodings_db = {"encodings": []}
-
-                encoding_record = {
-                    "name": name,
-                    "encoding": face_encoding.tolist(),
-                    "file": filename,
-                    "date_added": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "encoding_available": True
-                }
-                encodings_db["encodings"].append(encoding_record)
-                SecurityModule.save_encrypted_file(FACE_ENCODINGS_FILE, encodings_db)
-
-            except HTTPException:
-                raise
             except Exception as inner_e:
-                print(f"Error during face_recognition processing: {inner_e}")
-                raise HTTPException(status_code=500, detail="Face processing failed")
-
-        else:
-            # Fallback: use OpenCV Haar cascade to detect a face and save the image.
-            # We can't compute a face encoding without face_recognition, but we
-            # can still register the user and store the raw image for later processing.
-            if face_cascade is None:
-                raise HTTPException(status_code=500, detail="Face recognition engine not available and no cascade fallback found")
-
-            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
-            faces = face_cascade.detectMultiScale(gray, scaleFactor=1.1, minNeighbors=5)
-            if len(faces) == 0:
-                raise HTTPException(status_code=400, detail="No face detected in image (cascade fallback)")
-
-            # Save the original image (could also crop)
-            cv2.imwrite(filename, img)
-
-            encodings_db = SecurityModule.load_encrypted_file(FACE_ENCODINGS_FILE)
-            if not encodings_db:
-                encodings_db = {"encodings": []}
-
-            # Store a placeholder encoding record to keep the DB consistent
-            encoding_record = {
-                "name": name,
-                "encoding": [],
-                "file": filename,
-                "date_added": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "encoding_available": False
-            }
-            encodings_db["encodings"].append(encoding_record)
-            SecurityModule.save_encrypted_file(FACE_ENCODINGS_FILE, encodings_db)
-
-        # Save user data
-        users_db = SecurityModule.load_encrypted_file(USERS_DB)
-        if users_db is None:
-            users_db = {"users": []}
-
+                logging.error(f"Error during face_recognition processing for {name}: {inner_e}")
+                # Decide if this should stop registration or just mark encoding_available as False
+                # For now, let's proceed with encoding_available=False
+        
         user_record = {
             "name": name,
-            "driver_id": driver_id,
+            "driver_id": driver_id, # Document ID in Firestore
             "phone": phone,
             "vehicle_registration": vehicle_reg,
-            "registered_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            "registered_date": datetime.now(), # Firestore native timestamp
             "status": "ACTIVE",
-            "face_file": filename,
-            "encoding_available": FACE_RECOGNITION_AVAILABLE
+            "face_image_url": face_image_url,
+            "face_encoding": face_encoding_list, # Store encoding directly in user document
+            "encoding_available": bool(face_encoding_list)
         }
-        users_db["users"].append(user_record)
-        SecurityModule.save_encrypted_file(USERS_DB, users_db)
+        await SecurityModule.add_user(user_record)
 
-        return {"status": "success", "message": "User registered successfully"}
+        return {"status": "success", "message": "User registered successfully", "face_image_url": face_image_url}
     except HTTPException:
-        # Re-raise HTTP exceptions so FastAPI returns the intended status
         raise
     except Exception as e:
-        # Log the exception for debugging and return a safe error message
-        print(f"Registration error: {e}")
+        log_exception("register_user", e)
         raise HTTPException(status_code=500, detail="Registration failed: see server logs")
 
 @app.post("/api/verify-face")
 async def verify_face(face_image: UploadFile = File(...)):
-    try:
-        if not FACE_RECOGNITION_AVAILABLE:
-            return {"status": "error", "message": "face_recognition package not installed. Install it to use face verification.", "match_score": 0}
+    if not db:
+        raise HTTPException(status_code=500, detail="Firebase services not initialized.")
 
-        # Read and process the uploaded image
+    try:
         contents = await face_image.read()
         nparr = np.frombuffer(contents, np.uint8)
         img = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
@@ -426,48 +380,47 @@ async def verify_face(face_image: UploadFile = File(...)):
         if img is None:
             return {"status": "error", "message": "Could not decode uploaded image", "match_score": 0}
 
-        # Load face encodings database
-        encodings_db = SecurityModule.load_encrypted_file(FACE_ENCODINGS_FILE)
-        if not encodings_db or not encodings_db.get("encodings"):
+        all_users = await SecurityModule.get_all_users()
+        if not all_users:
             return {"status": "error", "message": "No registered faces found", "match_score": 0}
 
-        # If face_recognition is available, use the accurate method
+        best_match_score = 0
+        best_match_name = "UNKNOWN"
+        best_match_driver_id = None
+
+        config = await SecurityModule.get_system_config()
+        threshold = config.get("recognition_threshold", 0.6) if config else 0.6
+
         if FACE_RECOGNITION_AVAILABLE:
             try:
                 rgb_img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
                 face_locations = face_recognition.face_locations(rgb_img)
                 if not face_locations:
-                    return {"status": "error", "message": "No face detected", "match_score": 0}
+                    return {"status": "error", "message": "No face detected in probe image", "match_score": 0}
 
-                face_encoding = face_recognition.face_encodings(rgb_img, face_locations)[0]
+                probe_encoding = face_recognition.face_encodings(rgb_img, face_locations)[0]
 
-                best_match_score = 0
-                best_match_name = None
-                for user_data in encodings_db["encodings"]:
-                    if not user_data.get("encoding"):
-                        continue
-                    stored_encoding = np.array(user_data["encoding"])
-                    face_distance = face_recognition.face_distance([stored_encoding], face_encoding)[0]
-                    similarity_score = 1 - face_distance
-                    if similarity_score > best_match_score:
-                        best_match_score = similarity_score
-                        best_match_name = user_data["name"]
+                known_encodings = []
+                known_names_ids = []
+                for user_data in all_users:
+                    if user_data.get("encoding_available") and user_data.get("face_encoding"):
+                        known_encodings.append(np.array(user_data["face_encoding"]))
+                        known_names_ids.append((user_data["name"], user_data["driver_id"]))
 
-                config = SecurityModule.load_encrypted_file(CONFIG_FILE)
-                threshold = config.get("recognition_threshold", 0.6) if config else 0.6
+                if known_encodings:
+                    face_distances = face_recognition.face_distance(known_encodings, probe_encoding)
+                    best_match_index = np.argmin(face_distances)
+                    best_match_score = 1 - face_distances[best_match_index]
+                    best_match_name, best_match_driver_id = known_names_ids[best_match_index]
 
-                if best_match_score >= threshold:
-                    return {"status": "success", "message": "Face verified", "match_score": best_match_score, "user": best_match_name}
-                else:
-                    return {"status": "error", "message": "Face verification failed", "match_score": best_match_score}
             except Exception as e:
-                log_exception('verify_face', e)
-                return {"status": "error", "message": "Face verification error", "match_score": 0}
+                log_exception('verify_face_recognition', e)
+                # Fallback to histogram if face_recognition fails unexpectedly
+                pass
 
-        # Fallback simple verification using histogram correlation when face_recognition is not available
-        try:
+        # Fallback or if face_recognition is not available
+        if not FACE_RECOGNITION_AVAILABLE or best_match_score < threshold: # Only attempt if FR not available or didn't meet threshold
             def hist_similarity(a, b):
-                # compute HSV histogram similarity (correlation) scaled to 0..1
                 hsv_a = cv2.cvtColor(a, cv2.COLOR_BGR2HSV)
                 hsv_b = cv2.cvtColor(b, cv2.COLOR_BGR2HSV)
                 hist_a = cv2.calcHist([hsv_a], [0,1], None, [50,60], [0,180,0,256])
@@ -475,78 +428,111 @@ async def verify_face(face_image: UploadFile = File(...)):
                 cv2.normalize(hist_a, hist_a)
                 cv2.normalize(hist_b, hist_b)
                 score = cv2.compareHist(hist_a, hist_b, cv2.HISTCMP_CORREL)
-                # correlation can be in [-1,1], clamp and scale
-                score = max(min(score, 1.0), -1.0)
-                return (score + 1.0) / 2.0
+                return (score + 1.0) / 2.0 # Scale to 0-1
 
-            best_score = 0
-            best_name = None
-            for user_data in encodings_db["encodings"]:
-                file_path = user_data.get("file")
-                if not file_path or not os.path.exists(file_path):
+            fallback_best_score = 0
+            fallback_best_name = "UNKNOWN"
+            fallback_best_driver_id = None
+            
+            for user_data in all_users:
+                if not user_data.get("face_image_url"):
                     continue
-                try:
-                    stored = cv2.imread(file_path)
-                    if stored is None:
+                stored_image_bytes = await SecurityModule.download_face_image(user_data["face_image_url"])
+                if stored_image_bytes:
+                    stored_nparr = np.frombuffer(stored_image_bytes, np.uint8)
+                    stored_img = cv2.imdecode(stored_nparr, cv2.IMREAD_COLOR)
+                    if stored_img is None:
                         continue
-                    # Resize both to a comparable size to reduce scale effects
-                    stored_rs = cv2.resize(stored, (300,300))
-                    probe_rs = cv2.resize(img, (300,300))
-                    score = hist_similarity(stored_rs, probe_rs)
-                    if score > best_score:
-                        best_score = score
-                        best_name = user_data.get("name")
-                except Exception as inner:
-                    logging.warning(f"Failed similarity for {file_path}: {inner}")
+                    
+                    try:
+                        stored_rs = cv2.resize(stored_img, (300,300))
+                        probe_rs = cv2.resize(img, (300,300))
+                        score = hist_similarity(stored_rs, probe_rs)
+                        if score > fallback_best_score:
+                            fallback_best_score = score
+                            fallback_best_name = user_data.get("name")
+                            fallback_best_driver_id = user_data.get("driver_id")
+                    except Exception as inner:
+                        logging.warning(f"Failed histogram similarity for {user_data.get('name')}: {inner}")
+            
+            # If fallback score is better than FR score (or FR wasn't used/failed)
+            if fallback_best_score > best_match_score:
+                best_match_score = fallback_best_score
+                best_match_name = fallback_best_name
+                best_match_driver_id = fallback_best_driver_id
+                
+            threshold = config.get("recognition_threshold", 0.6) if config else 0.6 # Use same threshold for consistency
 
-            # Threshold: convert histogram score to 0..1; pick threshold 0.5 as baseline
-            threshold = 0.5
-            if best_score >= threshold:
-                return {"status": "success", "message": "Face verified (histogram fallback)", "match_score": best_score, "user": best_name}
-            else:
-                return {"status": "error", "message": "Face verification failed (histogram)", "match_score": best_score}
-        except Exception as e:
-            log_exception('verify_face_fallback', e)
-            return {"status": "error", "message": "Verification error", "match_score": 0}
+        status = "DENIED"
+        message = "Face verification failed"
+        if best_match_score >= threshold:
+            status = "GRANTED"
+            message = "Face verified"
+            if best_match_driver_id:
+                # Update last access and total accesses for the user
+                user_updates = {
+                    "last_access": datetime.now(),
+                    "total_accesses": firestore.Increment(1)
+                }
+                await SecurityModule.update_user(best_match_driver_id, user_updates)
+        
+        await log_access(best_match_name, "Face Verification", status, "POST", best_match_score)
+
+        return {"status": status, "message": message, "match_score": best_match_score, "user": best_match_name}
+
+    except HTTPException:
+        raise
     except Exception as e:
         log_exception('verify_face_outer', e)
-        return {"status": "error", "message": "Unexpected verification error", "match_score": 0}
+        await log_access("UNKNOWN", "Face Verification", "ERROR", "POST", 0)
+        raise HTTPException(status_code=500, detail="Unexpected verification error: see server logs")
 
 @app.post("/api/verify-pin")
 async def verify_pin(pin: str):
+    if not db:
+        raise HTTPException(status_code=500, detail="Firebase services not initialized.")
+    if not ENCRYPTION_KEY:
+        raise HTTPException(status_code=500, detail="ENCRYPTION_KEY not set. PIN verification is insecure.")
+
     try:
-        config = SecurityModule.load_encrypted_file(CONFIG_FILE)
+        config = await SecurityModule.get_system_config()
         if not config:
-            raise HTTPException(status_code=500, detail="System configuration error")
+            raise HTTPException(status_code=500, detail="System configuration error: config not found in Firestore.")
         
-        pin_hash = hashlib.sha256(pin.encode()).hexdigest()
-        if pin_hash == config["emergency_pin"]:
+        hashed_pin_input = SecurityModule.hash_pin(pin)
+        
+        if hashed_pin_input == config.get("emergency_pin_hash"):
+            await log_access("System Admin", "PIN Verification", "GRANTED", "POST")
             return {"status": "success", "message": "PIN verified"}
         else:
+            await log_access("System Admin", "PIN Verification", "DENIED", "POST")
             return {"status": "error", "message": "Invalid PIN"}
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        log_exception("verify_pin", e)
+        await log_access("System Admin", "PIN Verification", "ERROR", "POST")
+        raise HTTPException(status_code=500, detail=f"PIN verification failed: {e}")
 
 @app.get("/api/users")
 async def get_users():
-    """Get all registered users"""
+    """Get all registered users from Firestore"""
+    if not db:
+        raise HTTPException(status_code=500, detail="Firebase services not initialized.")
     try:
-        users_db = SecurityModule.load_encrypted_file(USERS_DB)
-        if not users_db:
-            return {"status": "success", "count": 0, "users": []}
+        all_users = await SecurityModule.get_all_users()
         
-        # Remove sensitive data
         users_list = []
-        for user in users_db.get("users", []):
+        for user in all_users:
             users_list.append({
-                "name": user["name"],
-                "driver_id": user["driver_id"],
-                "phone": user["phone"],
-                "vehicle_registration": user["vehicle_registration"],
-                "registered_date": user["registered_date"],
-                "status": user["status"],
+                "name": user.get("name"),
+                "driver_id": user.get("driver_id"),
+                "phone": user.get("phone"),
+                "vehicle_registration": user.get("vehicle_registration"),
+                "registered_date": user.get("registered_date").isoformat() if user.get("registered_date") else None,
+                "status": user.get("status"),
                 "total_accesses": user.get("total_accesses", 0),
-                "last_access": user.get("last_access", None)
+                "last_access": user.get("last_access").isoformat() if user.get("last_access") else None
             })
         
         return {
@@ -555,24 +541,25 @@ async def get_users():
             "users": users_list
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        log_exception("get_users", e)
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve users: {e}")
 
 @app.get("/api/logs")
 async def get_logs(status: Optional[str] = None, limit: int = 50):
-    """Get access logs"""
+    """Get access logs from Firestore"""
+    if not db:
+        raise HTTPException(status_code=500, detail="Firebase services not initialized.")
     try:
-        with open(ACCESS_LOG, 'r') as f:
-            logs_data = json.load(f)
-        
-        logs = logs_data.get("logs", [])
-        
-        # Filter by status if provided
+        logs_ref = db.collection('access_logs').order_by('timestamp', direction=firestore.Query.DESCENDING)
         if status:
-            logs = [log for log in logs if log["status"] == status]
+            logs_ref = logs_ref.where('status', '==', status)
         
-        # Get most recent logs
-        logs = logs[-limit:]
-        logs.reverse()  # Most recent first
+        logs_stream = logs_ref.limit(limit).stream()
+        logs = []
+        for log_doc in logs_stream:
+            log_data = log_doc.to_dict()
+            log_data["timestamp"] = log_data["timestamp"].isoformat()
+            logs.append(log_data)
         
         return {
             "status": "success",
@@ -580,24 +567,29 @@ async def get_logs(status: Optional[str] = None, limit: int = 50):
             "logs": logs
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        log_exception("get_logs", e)
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve logs: {e}")
 
 @app.get("/api/stats")
 async def get_stats():
-    """Get system statistics"""
+    """Get system statistics from Firestore"""
+    if not db:
+        raise HTTPException(status_code=500, detail="Firebase services not initialized.")
     try:
-        # Load users
-        users_db = SecurityModule.load_encrypted_file(USERS_DB)
-        total_users = len(users_db.get("users", [])) if users_db else 0
+        # Get total users
+        users_count_query = await db.collection('users').count().get()
+        total_users = users_count_query[0].value
+
+        # Get total access logs
+        logs_count_query = await db.collection('access_logs').count().get()
+        total_accesses = logs_count_query[0].value
         
-        # Load logs
-        with open(ACCESS_LOG, 'r') as f:
-            logs_data = json.load(f)
-        
-        logs = logs_data.get("logs", [])
-        total_accesses = len(logs)
-        granted_count = len([log for log in logs if log["status"] == "GRANTED"])
-        denied_count = len([log for log in logs if log["status"] == "DENIED"])
+        # Get granted/denied counts
+        granted_query = await db.collection('access_logs').where('status', '==', 'GRANTED').count().get()
+        granted_count = granted_query[0].value
+
+        denied_query = await db.collection('access_logs').where('status', '==', 'DENIED').count().get()
+        denied_count = denied_query[0].value
         
         success_rate = (granted_count / total_accesses * 100) if total_accesses > 0 else 0
         
@@ -612,7 +604,8 @@ async def get_stats():
             }
         }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        log_exception("get_stats", e)
+        raise HTTPException(status_code=500, detail=f"Failed to retrieve stats: {e}")
 
 @app.get("/")
 async def root():
@@ -620,33 +613,29 @@ async def root():
     return {
         "status": "online",
         "message": "Biometric Car Security API",
-        "version": "3.0",
+        "version": "3.0-Firebase",
         "timestamp": datetime.now().isoformat(),
-        "face_recognition": "Available" if FACE_RECOGNITION_AVAILABLE else "Basic Mode"
+        "face_recognition": "Available" if FACE_RECOGNITION_AVAILABLE else "Basic Mode (No FR)"
     }
 
 @app.get("/api/health")
 async def health_check():
-    """Detailed health check"""
+    """Detailed health check including Firebase service status"""
+    firestore_status = "OK" if db else "ERROR"
+    gcs_status = "OK" if gcs_bucket else "ERROR"
+    try:
+        if db: await db.collection('settings').document('system_config').get() # Simple Firestore ping
+        if gcs_bucket: gcs_bucket.blob("health_check_test.txt").exists() # Simple GCS ping
+    except Exception:
+        firestore_status = "UNREACHABLE" if db else firestore_status
+        gcs_status = "UNREACHABLE" if gcs_bucket else gcs_status
+
     return {
         "status": "online",
         "database": {
-            "users": os.path.exists(USERS_DB),
-            "encodings": os.path.exists(FACE_ENCODINGS_FILE),
-            "config": os.path.exists(CONFIG_FILE),
-            "logs": os.path.exists(ACCESS_LOG)
+            "firestore_client": firestore_status,
+            "cloud_storage_client": gcs_status,
         },
-        "face_recognition": FACE_RECOGNITION_AVAILABLE,
+        "face_recognition_lib": FACE_RECOGNITION_AVAILABLE,
         "timestamp": datetime.now().isoformat()
     }
-
-if __name__ == "__main__":
-    import uvicorn
-    print("\n" + "="*60)
-    print(" BIOMETRIC CAR SECURITY API SERVER")
-    print("="*60)
-    print("\n Server will start at: http://localhost:8000")
-    print(" API Documentation: http://localhost:8000/docs")
-    print("\n" + "="*60 + "\n")
-    
-    uvicorn.run(app, host="0.0.0.0", port=8000)
